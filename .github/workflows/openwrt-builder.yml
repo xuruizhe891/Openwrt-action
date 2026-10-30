@@ -1,8 +1,12 @@
 #
 # https://github.com/P3TERX/Actions-OpenWrt
 #
-# File: .github/workflows/openwrt-bulder.yml
+# File: .github/workflows/openwrt-builder.yml
 # Description: Build OpenWrt using GitHub Actions
+#
+# 本项目改造(2026-10-31,基于 P3TERX Actions-OpenWrt 模板):
+# 公开编译仓库,checkout 私有源码仓库构建 TL-7DR7230 v2 固件;
+# 版本号经 workflow 输入注入,Release 全部保留,构建日志单独归档。
 #
 # Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
 #
@@ -15,12 +19,23 @@ name: OpenWrt Builder
 on:
   repository_dispatch:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号(如 v10.x-修复某项);留空时用源码 git 短提交号'
+        required: false
+        default: ''
+      ref:
+        description: '私有源码仓库检出的分支或提交;留空时用默认分支'
+        required: false
+        default: ''
 
 env:
-  REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
+  # 私有源码仓库坐标(建仓后把占位改为实际的 owner/仓库名)
+  SOURCE_REPO: <owner>/<source-repo>
+  SOURCE_REPO_REF: main
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
+  # 构建配置来源:私有源码仓库内的设备构建配置(拷为 .config 后 make defconfig)
+  CONFIG_FILE: configs/tl-7dr7230-v2.config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
@@ -50,12 +65,20 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+    - name: Checkout private source repository
+      uses: actions/checkout@v7
+      with:
+        repository: ${{ env.SOURCE_REPO }}
+        ref: ${{ inputs.ref || github.event.client_payload.ref || env.SOURCE_REPO_REF }}
+        token: ${{ secrets.SOURCE_REPO_TOKEN }}
+        path: openwrt
+        persist-credentials: false
+
+    - name: Record disk space
+      run: df -hT
+
+    - name: Record source commit
+      run: echo "SOURCE_COMMIT=$(git -C openwrt rev-parse HEAD)" >> $GITHUB_ENV
 
     - name: Load custom feeds
       run: |
@@ -71,9 +94,11 @@ jobs:
       run: cd openwrt && ./scripts/feeds install -a
 
     - name: Load custom configuration
+      env:
+        BUILD_VERSION: ${{ inputs.version || github.event.client_payload.version || '' }}
       run: |
         [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        cp openwrt/$CONFIG_FILE openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
@@ -91,8 +116,9 @@ jobs:
       id: compile
       run: |
         cd openwrt
+        set -o pipefail
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        (make -j$(nproc) || make -j1 || make -j1 V=s) 2>&1 | tee /workdir/build.log
         echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
@@ -101,6 +127,17 @@ jobs:
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
+
+    - name: Upload build logs
+      uses: actions/upload-artifact@main
+      if: (!cancelled())
+      continue-on-error: true
+      with:
+        name: build-logs-${{ env.BUILD_VERSION_FINAL || github.run_number }}
+        path: |
+          /workdir/build.log
+          openwrt/logs
+        retention-days: 90
 
     - name: Upload bin directory
       uses: actions/upload-artifact@main
@@ -115,6 +152,12 @@ jobs:
       run: |
         cd openwrt/bin/targets/*/*
         rm -rf packages
+        {
+          echo "version: ${BUILD_VERSION_FINAL}"
+          echo "commit: ${SOURCE_COMMIT}"
+          echo "built_at: $(date +%FT%T%z)"
+          echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        } > version.txt
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -122,16 +165,19 @@ jobs:
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        name: firmware-${{ env.BUILD_VERSION_FINAL }}${{ env.DEVICE_NAME }}
         path: ${{ env.FIRMWARE }}
 
     - name: Generate release tag
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "release_tag=${BUILD_VERSION_FINAL}" >> $GITHUB_OUTPUT
+        {
+          echo "固件版本:${BUILD_VERSION_FINAL}"
+          echo "源码提交:${SOURCE_COMMIT}"
+          echo "构建记录:${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        } > release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware to release
@@ -144,17 +190,4 @@ jobs:
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # 运行记录与 Release 不主动清理(用户裁决:Release 全部保留;运行记录靠平台 90 天保留期自然过期)
