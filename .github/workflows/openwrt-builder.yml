@@ -84,6 +84,17 @@ jobs:
         path: openwrt
         persist-credentials: false
 
+    - name: Restore build cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          openwrt/dl
+          openwrt/staging_dir
+          openwrt/build_dir
+        key: openwrt-build-${{ github.run_number }}
+        restore-keys: |
+          openwrt-build-
+
     - name: Record disk space
       run: df -hT
 
