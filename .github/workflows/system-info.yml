@@ -1,0 +1,27 @@
+name: System Info Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  system-info:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Collect runner hardware information
+        run: |
+          echo "== uname =="
+          uname -a
+          echo "== OS release =="
+          cat /etc/os-release
+          echo "== CPU (lscpu) =="
+          lscpu
+          echo "== CPU count (nproc) =="
+          nproc
+          echo "== Memory (free -h) =="
+          free -h
+          echo "== Disk (df -h) =="
+          df -h
+          echo "== Block devices (lsblk) =="
+          lsblk
+          echo "== Top-level directories =="
+          ls -la /
