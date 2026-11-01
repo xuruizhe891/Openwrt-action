@@ -111,6 +111,22 @@ jobs:
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
 
+    - name: Verify feeds lock
+      run: |
+        # 层 1 声明一致性:feeds.conf.default 声明的锁定 commit 必须与实际拉到的一致(^commit 幂等,不符即配置或拉取事故,直接失败)
+        fail=0
+        for feed in packages luci routing telephony; do
+          lock=$(grep "^src-git $feed " openwrt/feeds.conf.default | sed -n 's/.*\^\([0-9a-f]\{40\}\)$/\1/p')
+          actual=$(git -C "openwrt/feeds/$feed" rev-parse HEAD)
+          if [ "$lock" != "$actual" ]; then
+            echo "ERROR: $feed 锁定不符 declared=$lock actual=$actual"
+            fail=1
+          else
+            echo "OK: $feed $actual"
+          fi
+        done
+        exit $fail
+
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
@@ -175,6 +191,45 @@ jobs:
           echo "--- 构建产物体积 ---"
         } > "$INFO"
         find openwrt/bin/targets -type f \( -name '*.itb' -o -name '*.bin' -o -name '*.fip' \) -exec du -h {} \; >> "$INFO" 2>/dev/null || true
+        # 层 2 上游待审:锁定 commit 对分支头,按 feed 分组输出 ahead 与涉及包目录(ahead 时才列出;files 在 compare API 有 300 截断,全量以 total_commits 为准)
+        {
+          echo "--- 上游待审(锁定 commit 对分支头,按 feed 分组) ---"
+          python3 - <<'PYEOF'
+        import json, subprocess, re
+        # feed 源坐标:feeds.conf.default 固定为 ^commit 后,对照分支信息在本表维护(改 feed 源或分支时同步此表)
+        FEEDS = {
+            "packages": ("immortalwrt/packages", "openwrt-24.10"),
+            "luci": ("immortalwrt/luci", "openwrt-24.10"),
+            "routing": ("openwrt/routing", "openwrt-24.10"),
+            "telephony": ("openwrt/telephony", "openwrt-24.10"),
+        }
+        conf = open("openwrt/feeds.conf.default").read()
+        for feed, (repo, branch) in FEEDS.items():
+            m = re.search(rf"^src-git {feed} \S+\^([0-9a-f]{{40}})$", conf, re.M)
+            if not m:
+                print(f"[{feed}] feeds.conf 未找到锁定 commit,检查源表与配置")
+                continue
+            lock = m.group(1)
+            r = subprocess.run(["gh", "api", f"repos/{repo}/compare/{lock}...{branch}"], capture_output=True, text=True)
+            if r.returncode:
+                print(f"[{feed}] compare 失败: {r.stderr.strip()[:120]}")
+                continue
+            d = json.loads(r.stdout)
+            ahead = d.get("ahead_by", 0)
+            total = d.get("total_commits", 0)
+            if ahead == 0:
+                print(f"[{feed}] ahead=0(与分支头一致)")
+                continue
+            pkgs = set()
+            for f in d.get("files", []):
+                mm = re.match(r"^([^/]+/[^/]+)/", f.get("filename", ""))
+                if mm:
+                    pkgs.add(mm.group(1))
+            trunc = " (files 列表可能被 compare API 截断,以 total_commits 为准)" if len(d.get("files", [])) >= 300 else ""
+            print(f"[{feed}] ahead={ahead} total_commits={total},涉及包目录 {len(pkgs)} 个:")
+            print("  " + " ".join(sorted(pkgs)) + trunc)
+        PYEOF
+        } >> "$INFO" || true
         wc -l "$INFO"
 
     - name: Upload build logs
