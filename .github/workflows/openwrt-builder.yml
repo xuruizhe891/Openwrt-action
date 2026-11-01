@@ -149,6 +149,13 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
+    - name: Extract build errors
+      if: failure()
+      continue-on-error: true
+      run: |
+        grep -n -E "fatal error|undefined reference|Error [0-9]|Hunk.*FAILED|No rule to make target|error:" /workdir/build.log > /workdir/build-errors.txt || true
+        wc -l /workdir/build-errors.txt
+
     - name: Upload build logs
       uses: actions/upload-artifact@main
       if: (!cancelled())
@@ -157,6 +164,7 @@ jobs:
         name: build-logs-${{ env.BUILD_VERSION_FINAL || github.run_number }}
         path: |
           /workdir/build.log
+          /workdir/build-errors.txt
           openwrt/logs
         retention-days: 90
 
@@ -183,7 +191,10 @@ jobs:
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
       run: |
         cd openwrt/bin/targets/*/*
-        rm -rf packages
+        if [ -d packages ]; then
+          tar -cf - packages | zstd -T0 -o packages.tar.zst
+          rm -rf packages
+        fi
         {
           echo "version: ${BUILD_VERSION_FINAL}"
           echo "commit: ${SOURCE_COMMIT}"
