@@ -175,6 +175,8 @@ jobs:
     - name: Generate build info
       if: (!cancelled())
       continue-on-error: true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         LOG=/workdir/build.log
         INFO=/workdir/build-info.txt
