@@ -167,6 +167,17 @@ jobs:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
 
+    - name: Upload package artifacts
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      continue-on-error: true
+      with:
+        name: packages-${{ env.BUILD_VERSION_FINAL }}
+        path: |
+          openwrt/bin/packages
+          openwrt/bin/targets/*/*/packages
+        retention-days: 90
+
     - name: Organize files
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
