@@ -274,8 +274,18 @@ jobs:
           tar -cf - packages | zstd -T0 -o packages.tar.zst
           rm -rf packages
         fi
-        # dtb 随 Release 归档:DTS 验证直接取 dtb 反编译,免解 itb;补丁统计随轮可对比
-        cp "$GITHUB_WORKSPACE"/openwrt/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/*.dtb . 2>/dev/null || true
+        # 1. 归档本设备专属独立 DTB (TL-7DR7230 v2 专属,供 DTS 反编译核对;避免使用 *.dtb 通配符误拷入 50+ 无关移动芯片 dtb)
+        cp "$GITHUB_WORKSPACE"/openwrt/build_dir/target-*/linux-*/image-mt7988d-tplink-tl-7dr7230-v2.dtb ./mt7988d-tplink-tl-7dr7230-v2.dtb 2>/dev/null || true
+
+        # 2. 分卷打包目标架构编译目录 (包含打完所有补丁的内核完整 C 源码、MTK 私有驱动源码、全套 .o/.ko 目标文件与 .o.cmd 宏定义记录)
+        # 机制: 单卷 1500M(1.5GB) 避开 GitHub Release 单文件 2048M(2GB) 上限; 管道直出压缩与切片, 零中间未压缩磁盘冗余
+        echo "--- 开始分卷打包 target-aarch64 编译目录 ---"
+        tar -cf - -C "$GITHUB_WORKSPACE"/openwrt/build_dir target-aarch64_generic+cortex-a73_musl \
+          | zstd -T0 -3 \
+          | split -b 1500M -d - target-build-dir.tar.zst.part
+        echo "--- target-aarch64 分卷打包完成, 生成分卷清单: ---"
+        ls -lh target-build-dir.tar.zst.part* || true
+
         cp /workdir/build-info.txt . 2>/dev/null || true
         {
           echo "version: ${BUILD_VERSION_FINAL}"
@@ -302,6 +312,9 @@ jobs:
           echo "固件版本:${BUILD_VERSION_FINAL}"
           echo "源码提交:${SOURCE_COMMIT}"
           echo "构建记录:${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo ""
+          echo "--- 编译现场分卷还原说明 ---"
+          echo "本地合并解包命令: cat target-build-dir.tar.zst.part* | zstd -d | tar -xf -"
         } > release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
