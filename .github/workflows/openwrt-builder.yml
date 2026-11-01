@@ -156,6 +156,27 @@ jobs:
         grep -n -E "fatal error|undefined reference|Error [0-9]|Hunk.*FAILED|No rule to make target|error:" /workdir/build.log > /workdir/build-errors.txt || true
         wc -l /workdir/build-errors.txt
 
+    - name: Generate build info
+      if: (!cancelled())
+      continue-on-error: true
+      run: |
+        LOG=/workdir/build.log
+        INFO=/workdir/build-info.txt
+        {
+          echo "version: ${BUILD_VERSION_FINAL}"
+          echo "commit: ${SOURCE_COMMIT}"
+          echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "--- 补丁应用统计(build.log) ---"
+          echo "patch_start: $(grep -c 'Patching ' "$LOG" || true)"
+          echo "hunk_succeeded: $(grep -c 'succeeded at' "$LOG" || true)"
+          echo "hunk_offset: $(grep -c 'offset ' "$LOG" || true)"
+          echo "hunk_fuzz: $(grep -c 'fuzz ' "$LOG" || true)"
+          echo "hunk_failed_or_reversed: $(grep -cE 'FAILED|Reversed' "$LOG" || true)"
+          echo "--- 构建产物体积 ---"
+        } > "$INFO"
+        find openwrt/bin/targets -type f \( -name '*.itb' -o -name '*.bin' -o -name '*.fip' \) -exec du -h {} \; >> "$INFO" 2>/dev/null || true
+        wc -l "$INFO"
+
     - name: Upload build logs
       uses: actions/upload-artifact@main
       if: (!cancelled())
@@ -165,6 +186,7 @@ jobs:
         path: |
           /workdir/build.log
           /workdir/build-errors.txt
+          /workdir/build-info.txt
           openwrt/logs
         retention-days: 90
 
@@ -195,6 +217,9 @@ jobs:
           tar -cf - packages | zstd -T0 -o packages.tar.zst
           rm -rf packages
         fi
+        # dtb 随 Release 归档:DTS 验证直接取 dtb 反编译,免解 itb;补丁统计随轮可对比
+        cp "$GITHUB_WORKSPACE"/openwrt/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/*.dtb . 2>/dev/null || true
+        cp /workdir/build-info.txt . 2>/dev/null || true
         {
           echo "version: ${BUILD_VERSION_FINAL}"
           echo "commit: ${SOURCE_COMMIT}"
