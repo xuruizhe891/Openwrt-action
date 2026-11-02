@@ -114,10 +114,15 @@ jobs:
     - name: Verify feeds lock
       run: |
         # 层 1 声明一致性:feeds.conf.default 声明的锁定 commit 必须与实际拉到的一致(^commit 幂等,不符即配置或拉取事故,直接失败)
+        # 无锁定声明的分支形态(历史基线锚定提交,早于 ECR-v10.0-034 的 feeds 固定)警告放行不计失败,有声明时维持严格比对
         fail=0
         for feed in packages luci routing telephony; do
           lock=$(grep "^src-git $feed " openwrt/feeds.conf.default | sed -n 's/.*\^\([0-9a-f]\{40\}\)$/\1/p')
           actual=$(git -C "openwrt/feeds/$feed" rev-parse HEAD)
+          if [ -z "$lock" ]; then
+            echo "WARN: $feed 无 ^commit 锁定声明,跳过校验 actual=$actual"
+            continue
+          fi
           if [ "$lock" != "$actual" ]; then
             echo "ERROR: $feed 锁定不符 declared=$lock actual=$actual"
             fail=1
