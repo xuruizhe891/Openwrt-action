@@ -33,7 +33,7 @@ done
 grep -q '^CONFIG_VERSIONOPT=y' .config || echo 'CONFIG_VERSIONOPT=y' >> .config
 grep -q '^CONFIG_VERSION_FILENAMES=y' .config || echo 'CONFIG_VERSION_FILENAMES=y' >> .config
 
-# 3. 核心补齐:写入内核本地版本号 CONFIG_LOCALVERSION(控制内核 vermagic,防止驱动模块版本混用)。
+# 3. 写入内核本地版本号 CONFIG_LOCALVERSION(控制内核 vermagic,防止驱动模块版本混用)。
 KCFG="target/linux/mediatek/filogic_a73/config-6.6"
 if [ -f "$KCFG" ]; then
     if grep -q '^CONFIG_LOCALVERSION=' "$KCFG"; then
