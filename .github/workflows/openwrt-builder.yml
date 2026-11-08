@@ -16,7 +16,7 @@
 
 name: OpenWrt Builder
 
-run-name: ${{ inputs.label || inputs.version || format('run #{0}', github.run_number) }}
+run-name: ${{ inputs.label || inputs.version || format('run-{0}', github.run_number) }}
 
 on:
   repository_dispatch:
