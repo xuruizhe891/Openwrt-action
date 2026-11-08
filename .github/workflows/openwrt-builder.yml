@@ -177,6 +177,129 @@ jobs:
         grep -n -E "fatal error|undefined reference|Error [0-9]|Hunk.*FAILED|No rule to make target|error:" /workdir/build.log > /workdir/build-errors.txt || true
         wc -l /workdir/build-errors.txt
 
+    - name: Collect symbol closure evidence
+      if: (!cancelled())
+      continue-on-error: true
+      run: |
+        # 目的: 把符号闭包的三处关节(导出端 Module.symvers / 收集端 symvers/<包名>.symvers / 注入端 KBUILD_EXTRA_SYMBOLS)
+        # 以及编译宏与导入导出符号的最终事实, 落成六个文本文件, 随 build-logs artifact 归档.
+        # 全部步骤容错, 任何一步失败都不阻塞后续步骤与上传.
+        set +e
+        W="$GITHUB_WORKSPACE/openwrt"
+        B="$W/build_dir"
+        OUT=/workdir
+        LOG=/workdir/build.log
+
+        # 1) 收集端: symvers 目录下每个 <包名>.symvers 的文件名, 字节数, 行数
+        #    只取 */symvers/*.symvers, 排除各包 M= 目录下的 Module.symvers(那是导出端, 见下一段)
+        {
+          echo "# 收集端产物: 符号收集钩子汇总出的 <包名>.symvers"
+          echo "# 格式: 行数<TAB>字节数<TAB>路径"
+          echo "# 判读: 某包的 symvers 行数明显少于它子目录 Module.symvers 的行数时, 收集端读错了位置(见 mt_wifi_cmn 目录准则 7.5)"
+          find "$B" -path '*/symvers/*.symvers' -type f 2>/dev/null | sort | while read -r f; do
+            printf '%s\t%s\t%s\n' "$(wc -l < "$f" 2>/dev/null || echo 0)" "$(stat -c %s "$f" 2>/dev/null || echo 0)" "${f#$W/}"
+          done
+        } > "$OUT/symvers-index.txt" 2>/dev/null
+
+        # 2) 导出端: 全部 Module.symvers 与 Module.symvers.tmp, 逐个全量输出(每份通常只有几十行)
+        {
+          echo "# 导出端产物: 每个 Kbuild M= 目录下的 Module.symvers 与合并中间件 Module.symvers.tmp"
+          echo "# 判读: 第四列是导出形态(EXPORT_SYMBOL 或 EXPORT_SYMBOL_GPL), 决定下游闭源模块能否引用"
+          find "$B" \( -name 'Module.symvers' -o -name 'Module.symvers.tmp' \) -type f 2>/dev/null | sort | while read -r f; do
+            echo "=== ${f#$W/}  行数=$(wc -l < "$f" 2>/dev/null || echo 0)  字节=$(stat -c %s "$f" 2>/dev/null || echo 0)"
+            cat "$f" 2>/dev/null
+            echo
+          done
+        } > "$OUT/module-symvers-index.txt" 2>/dev/null
+
+        # 3) 注入端: build.log 里每条 KBUILD_EXTRA_SYMBOLS= 的行号与内容, 加去重后的可见文件集合与首次出现行号
+        python3 - "$LOG" > "$OUT/kbuild-extra-symbols.txt" 2>/dev/null <<'PYEOF'
+        import re, sys
+        path = sys.argv[1]
+        with open(path, "r", encoding="utf-8", errors="replace") as h:
+            lines = h.readlines()
+        pat = re.compile(r'KBUILD_EXTRA_SYMBOLS="(.*?)"')
+        first = {}
+        print("# 注入端: build.log 里每条 KBUILD_EXTRA_SYMBOLS 的展开值")
+        print("# 判读: 一个包能解析哪些跨包符号, 由它编译时 symvers 目录下已存在的 .symvers 决定, 因此可见性随构建顺序增长")
+        print()
+        print("=== 出现顺序与行号 ===")
+        for i, line in enumerate(lines, 1):
+            m = pat.search(line)
+            if not m:
+                continue
+            val = m.group(1)
+            files = [x for x in val.split() if x]
+            ctx = ""
+            mc = re.search(r'M="(.*?)"', line)
+            if mc:
+                ctx = mc.group(1).split("/")[-1]
+            print(f"行 {i}\t包={ctx or "(未识别)"}\t可见文件数={len(files)}")
+            for f in files:
+                print(f"    {f}")
+                first.setdefault(f.split("/")[-1], i)
+        print()
+        print("=== 首次出现行号(按首次出现升序) ===")
+        for name, i in sorted(first.items(), key=lambda kv: kv[1]):
+            print(f"{i}\t{name}")
+        PYEOF
+
+        # 4) modpost 结果: 只取故障信号与每次 modpost 的行
+        {
+          echo "# modpost 结果: 无 undefined! 与 GPL-incompatible 命中即链接闭合且许可证合规"
+          echo "=== MODPOST 行 ==="
+          grep -n 'MODPOST' "$LOG" 2>/dev/null
+          echo "=== undefined! ==="
+          grep -n 'undefined!' "$LOG" 2>/dev/null
+          echo "=== GPL-incompatible ==="
+          grep -n 'GPL-incompatible' "$LOG" 2>/dev/null
+          echo "=== KBUILD_MODPOST_WARN ==="
+          grep -n 'KBUILD_MODPOST_WARN' "$LOG" 2>/dev/null
+        } > "$OUT/modpost-results.txt" 2>/dev/null
+
+        # 5) 编译宏: 五个 mtk 包构建树里每个 .o.cmd 的 -D 全集
+        {
+          echo "# 编译宏: 每个目标文件 .o.cmd 里的 -D 全集(去重排序)"
+          echo "# 判读: 源码里 grep 到 #ifdef 不等于编译时该宏生效; .o.cmd 是最终裁判"
+          for pkg in mt_wifi_cmn mt_wifi7 mt_hwifi warp pce; do
+            for d in "$B"/target-*/linux-*/"$pkg"; do
+              [ -d "$d" ] || continue
+              echo "=== ${d#$W/}"
+              find "$d" -name '*.o.cmd' -type f 2>/dev/null | sort | while read -r cmd; do
+                echo "--- ${cmd#$d/}"
+                grep -o '\-D[A-Za-z_0-9]*' "$cmd" 2>/dev/null | sort -u | tr '\n' ' '
+                echo
+              done
+            done
+          done
+        } > "$OUT/obj-cmd-macros.txt" 2>/dev/null
+
+        # 6) ko 的导入导出符号: 未剥离版与 ipkg/rootfs 剥离版各一份
+        {
+          echo "# ko 符号: 每个 ko 的文件大小, 导出符号数, 导出符号清单, 导入(未定义)符号清单"
+          echo "# 判读: 未定义符号为 mt_ 前缀者应能在 symvers-index.txt 里找到对应 <包名>.symvers"
+          for pkg in mt_wifi_cmn mt_wifi7 mt_hwifi warp pce; do
+            for d in "$B"/target-*/linux-*/"$pkg"; do
+              [ -d "$d" ] || continue
+              find "$d" -name '*.ko' -type f 2>/dev/null | sort | while read -r ko; do
+                echo "=== ${ko#$W/}  字节=$(stat -c %s "$ko" 2>/dev/null || echo 0)"
+                echo "--- 导出符号数"
+                nm --defined-only "$ko" 2>/dev/null | wc -l
+                echo "--- 导出符号(全局 T/D/B/R 型)"
+                nm --defined-only "$ko" 2>/dev/null | grep -E '^[0-9a-f]+ [TDBR] ' | awk '{print $3}' | sort
+                echo "--- 未定义符号"
+                nm -u "$ko" 2>/dev/null | awk '{print $2}' | sort -u
+                echo
+              done
+            done
+          done
+        } > "$OUT/ko-symbols.txt" 2>/dev/null
+
+        # 7) 索引文件自检: 行数与字节数打一行汇总, 便于在 Actions 页面直接看产物是否为空
+        for f in symvers-index.txt module-symvers-index.txt kbuild-extra-symbols.txt modpost-results.txt obj-cmd-macros.txt ko-symbols.txt; do
+          printf '%s: %s 行, %s 字节\n' "$f" "$(wc -l < "$OUT/$f" 2>/dev/null || echo 0)" "$(stat -c %s "$OUT/$f" 2>/dev/null || echo 0)"
+        done
+
     - name: Generate build info
       if: (!cancelled())
       continue-on-error: true
@@ -190,11 +313,17 @@ jobs:
           echo "commit: ${SOURCE_COMMIT}"
           echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "--- 补丁应用统计(build.log) ---"
-          echo "patch_start: $(grep -c 'Patching ' "$LOG" || true)"
-          echo "hunk_succeeded: $(grep -c 'succeeded at' "$LOG" || true)"
-          echo "hunk_offset: $(grep -c 'offset ' "$LOG" || true)"
-          echo "hunk_fuzz: $(grep -c 'fuzz ' "$LOG" || true)"
-          echo "hunk_failed_or_reversed: $(grep -cE 'FAILED|Reversed' "$LOG" || true)"
+          # 口径说明(patch 的实际打印行为,非推测):
+          # 1) 每个补丁应用时打印 "Applying <路径> using <类型>:, 因此 patch_start 只匹配行首 Applying.
+          # 2) patch 只在 hunk 有偏移或模糊匹配时才打印 "Hunk #N succeeded at ..."; 无偏移的 hunk 不打印任何成功行.
+          #    因此下面 hunk_* 三项统计的是"带偏移或模糊的成功 hunk", 不是全部成功 hunk; 全部成功数无法从日志精确计数.
+          # 3) 失败与反向只认行首形态, 避免补丁文件名里含 FAILED 字样造成的误统计(历史轮次曾因此把 0 报成 4).
+          echo "patch_start: $(grep -c '^Applying ' "$LOG" || true)"
+          echo "hunk_offset_or_fuzz_succeeded: $(grep -cE '^Hunk #[0-9]+ succeeded at' "$LOG" || true)"
+          echo "hunk_offset: $(grep -cE '^Hunk #[0-9]+ succeeded at .*\(offset ' "$LOG" || true)"
+          echo "hunk_fuzz: $(grep -cE '^Hunk #[0-9]+ succeeded at .* with fuzz' "$LOG" || true)"
+          echo "hunk_failed: $(grep -cE '^Hunk #[0-9]+ FAILED' "$LOG" || true)"
+          echo "patch_reversed: $(grep -cE '^[[:space:]]*Reversed' "$LOG" || true)"
           echo "--- 构建产物体积 ---"
         } > "$INFO"
         find openwrt/bin/targets -type f \( -name '*.itb' -o -name '*.bin' -o -name '*.fip' \) -exec du -h {} \; >> "$INFO" 2>/dev/null || true
@@ -249,6 +378,12 @@ jobs:
           /workdir/build.log
           /workdir/build-errors.txt
           /workdir/build-info.txt
+          /workdir/symvers-index.txt
+          /workdir/module-symvers-index.txt
+          /workdir/kbuild-extra-symbols.txt
+          /workdir/modpost-results.txt
+          /workdir/obj-cmd-macros.txt
+          /workdir/ko-symbols.txt
           openwrt/logs
         retention-days: 90
 
@@ -290,6 +425,39 @@ jobs:
           | split -b 1500M -d - target-build-dir.tar.zst.part
         echo "--- target-aarch64 分卷打包完成, 生成分卷清单: ---"
         ls -lh target-build-dir.tar.zst.part* || true
+
+        # 3. 分卷打包 host/hostpkg/toolchain 三个编译目录 (宿主机与交叉工具链侧,含 hostpkg 装出的全部 host 工具)
+        echo "--- 开始分卷打包 host 侧编译目录 ---"
+        HOST_SRCS=""
+        for d in host hostpkg; do
+          [ -d "$GITHUB_WORKSPACE/openwrt/build_dir/$d" ] && HOST_SRCS="$HOST_SRCS $d"
+        done
+        for d in "$GITHUB_WORKSPACE"/openwrt/build_dir/toolchain-*; do
+          [ -d "$d" ] && HOST_SRCS="$HOST_SRCS $(basename "$d")"
+        done
+        if [ -n "$HOST_SRCS" ]; then
+          tar -cf - -C "$GITHUB_WORKSPACE"/openwrt/build_dir $HOST_SRCS \
+            | zstd -T0 -3 \
+            | split -b 1500M -d - host-build-dir.tar.zst.part
+          ls -lh host-build-dir.tar.zst.part* || true
+        else
+          echo "host 侧编译目录不存在,跳过"
+        fi
+
+        # 4. 分卷打包 staging_dir 全部顶层目录 (含 pkginfo 下的 *.install 文件清单与 stamp 目录,二者是"包是否装进 rootfs"的直接证据)
+        echo "--- 开始分卷打包 staging_dir ---"
+        STAGE_SRCS=""
+        for d in "$GITHUB_WORKSPACE"/openwrt/staging_dir/*; do
+          [ -d "$d" ] && STAGE_SRCS="$STAGE_SRCS $(basename "$d")"
+        done
+        if [ -n "$STAGE_SRCS" ]; then
+          tar -cf - -C "$GITHUB_WORKSPACE"/openwrt/staging_dir $STAGE_SRCS \
+            | zstd -T0 -3 \
+            | split -b 1500M -d - staging-dir.tar.zst.part
+          ls -lh staging-dir.tar.zst.part* || true
+        else
+          echo "staging_dir 不存在,跳过"
+        fi
 
         cp /workdir/build-info.txt . 2>/dev/null || true
         {
