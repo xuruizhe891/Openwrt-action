@@ -48,12 +48,12 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
-  # Release 说明文件: 打包成 Release 资产, 同时是 Release 正文
-  RELEASE_NOTES: release-notes.md
-  # 是否把发版说明回写到私有源码仓库的 tmp/固件及编译日志/<版本号>/release-notes.md.
-  # 开启后, 发版结论在源码仓一处可查(与本地保存的日志目录同名同结构).
-  # 写入目标是本次检出的分支(SOURCE_REF), 不是 main, 因此不会改动 main 的线性历史.
-  UPLOAD_RELEASE_NOTES_TO_SOURCE: true
+  # 发版说明(代码变更清单)的正文路径: 生成在 /workdir, 复制进固件目录时按版本号命名,
+  # 因此同时成为 Release 资产、firmware artifact 的成员、firmware-bundle 的成员与 Release 正文.
+  # 不向私有源码仓库回写提交, 不产生任何提交.
+  RELEASE_NOTES: /workdir/release-notes.md
+  # 归档包里发版说明的文件名前缀, 实际文件名由版本号拼出, 便于一眼看出是哪一版
+  RELEASE_NOTES_PREFIX: release-notes-
 
 permissions:
   contents: write
@@ -117,7 +117,6 @@ jobs:
         INPUT_VERSION: ${{ inputs.version || github.event.client_payload.version || '' }}
       run: |
         echo "SOURCE_COMMIT=$(git -C openwrt rev-parse HEAD)" >> $GITHUB_ENV
-        echo "SOURCE_REF=${INPUT_REF}" >> $GITHUB_ENV
         echo "SOURCE_SHORT=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
         # 运行显示名: 优先用 label 输入; 其次用 version; 都没有时留空, run-name 已回退到 run 序号
         if [ -n "${INPUT_LABEL}" ]; then
@@ -535,11 +534,244 @@ jobs:
           openwrt/bin/targets/*/*/packages
         retention-days: 90
 
+    - name: Generate release notes
+      id: notes
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+      env:
+        GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+      run: |
+        # 发版说明只回答一个问题: 这次固件相对上次打包动了哪些代码.
+        # 上次打包的代码状态取自那个 Release 的 version.txt 里的 commit 字段, 不按分支名或分支头推测,
+        # 因此"上次打包"一定是一次真正出过固件的轮次. 领先与落后用 compare 接口计算,
+        # 落后这一侧覆盖 reset 场景: 强制推送覆盖掉、这版固件里已经不存在的提交单独列出.
+        # 构建证据(modpost 命中数、symvers 行数、ko 字节数)留在 build-logs artifact 与 build-info.txt, 不进这里.
+        echo "release_tag=${BUILD_VERSION_FINAL}" >> $GITHUB_OUTPUT
+        python3 - <<'PYEOF'
+        import json, os, subprocess, time
+
+        repo = os.environ["GITHUB_REPOSITORY"]
+        source_repo = os.environ["SOURCE_REPO"]
+        cur_version = os.environ["BUILD_VERSION_FINAL"]
+        cur_commit = os.environ["SOURCE_COMMIT"]
+        notes_path = os.environ["RELEASE_NOTES"]
+
+        STATUS_CN = {
+            "added": "新增",
+            "modified": "修改",
+            "removed": "删除",
+            "renamed": "重命名",
+            "copied": "复制",
+            "changed": "变化",
+        }
+
+
+        def gh(*args):
+            proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+            if proc.returncode != 0:
+                return None
+            return proc.stdout
+
+
+        def short(sha):
+            return sha[:10] if sha else "未知"
+
+
+        def commit_rows(commits):
+            rows = []
+            for idx, c in enumerate(commits, 1):
+                sha = (c.get("sha") or "")[:10]
+                author = (c.get("commit") or {}).get("author") or {}
+                date = (author.get("date") or "")[:10]
+                msg = ((c.get("commit") or {}).get("message") or "").split("\n")[0]
+                msg = msg.replace("|", "\\|")
+                rows.append("| %d | %s | %s | %s |" % (idx, date, sha, msg))
+            return rows
+
+
+        def group_files(files):
+            groups = {}
+            for f in files:
+                path = f.get("filename") or ""
+                status = STATUS_CN.get(f.get("status") or "", f.get("status") or "变化")
+                add = f.get("additions")
+                dele = f.get("deletions")
+                parent = os.path.dirname(path)
+                groups.setdefault(parent or "(仓库根)", []).append(
+                    (os.path.basename(path), status, add, dele)
+                )
+            return groups
+
+
+        def main():
+            now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+            today = now[:10]
+            lines = []
+            lines.append("# %s 固件发布说明(%s)" % (cur_version, today))
+            lines.append("")
+            lines.append("版本 %s, 构建日期 %s" % (cur_version, now))
+            lines.append("")
+            lines.append("| | 版本 | 代码状态 | 打包时间 |")
+            lines.append("|---|---|---|---|")
+
+            prev = None
+            out = gh(
+                "release", "list", "--repo", repo, "--limit", "50",
+                "--json", "tagName,isDraft,publishedAt",
+            )
+            if out:
+                releases = json.loads(out)
+                candidates = [
+                    r for r in releases
+                    if not r.get("isDraft")
+                    and r.get("publishedAt")
+                    and r.get("tagName") != cur_version
+                ]
+                if candidates:
+                    candidates.sort(key=lambda r: r.get("publishedAt") or "", reverse=True)
+                    prev = candidates[0]
+
+            prev_tag = prev.get("tagName") if prev else ""
+            prev_commit = ""
+            prev_built = ""
+            if prev_tag:
+                tmpdir = "/workdir/prev-release"
+                if not os.path.isdir(tmpdir):
+                    os.makedirs(tmpdir)
+                gh(
+                    "release", "download", prev_tag, "--repo", repo,
+                    "--pattern", "version.txt", "--dir", tmpdir, "--clobber",
+                )
+                vfile = os.path.join(tmpdir, "version.txt")
+                if os.path.exists(vfile):
+                    with open(vfile, encoding="utf-8") as fp:
+                        for line in fp:
+                            if line.startswith("commit:"):
+                                prev_commit = line.split(":", 1)[1].strip()
+                            elif line.startswith("built_at:"):
+                                prev_built = line.split(":", 1)[1].strip()
+
+            lines.append("| 本次 | %s | %s | %s |" % (cur_version, short(cur_commit), now))
+            if prev_tag:
+                lines.append(
+                    "| 上次 | %s | %s | %s |"
+                    % (prev_tag, short(prev_commit), prev_built or "未知")
+                )
+            else:
+                lines.append("| 上次 | 未找到上一次打包的 Release | - | - |")
+
+            lines.append("")
+            lines.append("## 代码变更(相对上次打包)")
+            lines.append("")
+
+            cmp_data = None
+            cmp_error = ""
+            if prev_commit and prev_commit != cur_commit:
+                out = gh(
+                    "api",
+                    "repos/%s/compare/%s...%s" % (source_repo, prev_commit, cur_commit),
+                )
+                if out:
+                    cmp_data = json.loads(out)
+                else:
+                    cmp_error = "compare 接口调用失败"
+
+            if not prev_tag:
+                lines.append("未找到上一次打包的 Release, 无法比对.")
+            elif not prev_commit:
+                lines.append("上一次打包的 Release %s 里没有 version.txt 的 commit 行, 无法比对." % prev_tag)
+            elif prev_commit == cur_commit:
+                lines.append("与上次打包的代码状态相同, 代码没有变化.")
+            elif not cmp_data:
+                lines.append(
+                    "比对失败(%s). 上次打包的提交若已从仓库中消失(强制推送覆盖后被回收), "
+                    "只能确认本次打包状态, 无法列出差异." % (cmp_error or "未知原因")
+                )
+            else:
+                ahead = cmp_data.get("ahead_by") or 0
+                behind = cmp_data.get("behind_by") or 0
+                commits = cmp_data.get("commits") or []
+                lines.append("本次相对上次打包: 新增 %d 笔, 缺少 %d 笔." % (ahead, behind))
+                lines.append("")
+                lines.append("### 新增 %d 笔" % ahead)
+                lines.append("")
+                if commits:
+                    lines.append("| 序号 | 日期 | 提交 | 标题 |")
+                    lines.append("|---|---|---|---|")
+                    lines.extend(commit_rows(commits))
+                    if ahead > len(commits):
+                        lines.append("")
+                        lines.append(
+                            "列表被接口截断(接口单次最多返回 %d 条), 总数以新增 %d 笔为准."
+                            % (len(commits), ahead)
+                        )
+                else:
+                    lines.append("无.")
+
+                lines.append("")
+                lines.append("### 缺少 %d 笔(上次打包有, 这版没有)" % behind)
+                lines.append("")
+                if behind > 0:
+                    behind_commits = []
+                    out = gh(
+                        "api",
+                        "repos/%s/compare/%s...%s" % (source_repo, cur_commit, prev_commit),
+                    )
+                    if out:
+                        behind_commits = json.loads(out).get("commits") or []
+                    if behind_commits:
+                        lines.append("| 序号 | 日期 | 提交 | 标题 |")
+                        lines.append("|---|---|---|---|")
+                        lines.extend(commit_rows(behind_commits))
+                        if behind > len(behind_commits):
+                            lines.append("")
+                            lines.append(
+                                "列表被接口截断(接口单次最多返回 %d 条), 总数以缺少 %d 笔为准."
+                                % (len(behind_commits), behind)
+                            )
+                    else:
+                        lines.append("这 %d 笔提交在仓库里已查不到明细, 只统计条数." % behind)
+                else:
+                    lines.append("无.")
+
+                files = cmp_data.get("files") or []
+                lines.append("")
+                lines.append("## 改动文件 %d 个" % len(files))
+                lines.append("")
+                lines.append("增删列是两次打包之间的净变化, 不是逐笔提交相加: 同一文件被多笔提交反复改动时, 只记最终差值.")
+                if len(files) >= 300:
+                    lines.append("")
+                    lines.append("注意: 接口的文件列表上限为 300 条, 实际改动可能更多.")
+                groups = group_files(files)
+                for parent in sorted(groups):
+                    lines.append("")
+                    lines.append("### %s" % parent)
+                    lines.append("")
+                    lines.append("| 文件 | 状态 | 增 | 删 |")
+                    lines.append("|---|---|---|---|")
+                    for name, status, add, dele in sorted(groups[parent]):
+                        lines.append(
+                            "| %s | %s | %s | %s |"
+                            % (name, status, "-" if add is None else add, "-" if dele is None else dele)
+                        )
+
+            body = "\n".join(lines) + "\n"
+            with open(notes_path, "w", encoding="utf-8") as fp:
+                fp.write(body)
+            print(body)
+
+
+        main()
+        PYEOF
+        echo "status=success" >> $GITHUB_OUTPUT
+        wc -l "${RELEASE_NOTES}"
+
     - name: Organize files
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
       run: |
         cd openwrt/bin/targets/*/*
+        # 0. 发版说明按版本号命名后写进固件目录: 于是它同时是 Release 资产、firmware artifact 的成员与归档包成员
+        cp "${RELEASE_NOTES}" "${RELEASE_NOTES_PREFIX}${BUILD_VERSION_FINAL}.md" 2>/dev/null || true
         if [ -d packages ]; then
           tar -cf - packages | zstd -T0 -o packages.tar.zst
           rm -rf packages
@@ -572,20 +804,8 @@ jobs:
           echo "编译现场目录一个都不存在, 跳过"
         fi
 
-        # 3. 把其余产物打成一个归档, 便于整包下载; 固件 itb 等单文件仍在 Release 里单独保留, 刷机不需要解包
-        echo "--- 开始打包其余产物 ---"
-        BUNDLE="firmware-bundle.tar.zst"
-        BUNDLE_SRCS=""
-        for f in *.itb *.fip *.bin *.manifest sha256sums profiles.json packages.tar.zst build-info.txt version.txt; do
-          [ -e "$f" ] && BUNDLE_SRCS="$BUNDLE_SRCS $f"
-        done
-        if [ -n "$BUNDLE_SRCS" ]; then
-          tar -cf - $BUNDLE_SRCS | zstd -T0 -o "$BUNDLE"
-          ls -lh "$BUNDLE" || true
-        else
-          echo "没有可打包的其余产物, 跳过"
-        fi
-
+        # 3. 先把 build-info.txt 与 version.txt 落齐, 再打包归档;
+        #    否则这两个文件生成在归档之后, firmware-bundle.tar.zst 里会缺件.
         cp /workdir/build-info.txt . 2>/dev/null || true
         {
           echo "version: ${BUILD_VERSION_FINAL}"
@@ -593,6 +813,23 @@ jobs:
           echo "built_at: $(date +%FT%T%z)"
           echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
         } > version.txt
+
+        # 4. 刷机固件、引导三段、设备树、包清单与校验和、包内容、构建统计与发版说明打成一个归档,
+        #    一次下载齐, 不用逐个点; itb 等单文件仍在 Release 里单独保留, 刷机不需要解包.
+        #    build.log 不进这个包(它在 build-logs artifact 里, 体积大且与刷机无关).
+        echo "--- 开始打包固件与发版说明归档 ---"
+        BUNDLE="firmware-bundle.tar.zst"
+        BUNDLE_SRCS=""
+        for f in *.itb *.fip *.bin *.dtb *.manifest sha256sums profiles.json packages.tar.zst build-info.txt version.txt "${RELEASE_NOTES_PREFIX}"*.md; do
+          [ -e "$f" ] && BUNDLE_SRCS="$BUNDLE_SRCS $f"
+        done
+        if [ -n "$BUNDLE_SRCS" ]; then
+          tar -cf - $BUNDLE_SRCS | zstd -T0 -o "$BUNDLE"
+          ls -lh "$BUNDLE" || true
+        else
+          echo "没有可打包的固件产物, 跳过"
+        fi
+
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -603,117 +840,9 @@ jobs:
         name: firmware-${{ env.BUILD_VERSION_FINAL }}${{ env.DEVICE_NAME }}
         path: ${{ env.FIRMWARE }}
 
-    - name: Generate release notes
-      id: notes
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
-      run: |
-        # 发版说明写成一个文件, 三个去向:
-        #   1) Release 资产(随固件一起下载, 见 Upload firmware to release 的 files 列表)
-        #   2) Release 正文(body_path)
-        #   3) 私有源码仓库的 tmp/固件及编译日志/<版本号>/release-notes.md(便于在源码仓一处查齐本轮结论)
-        echo "release_tag=${BUILD_VERSION_FINAL}" >> $GITHUB_OUTPUT
-        NOTES="${RELEASE_NOTES}"
-        {
-          echo "# ${BUILD_VERSION_FINAL}"
-          echo ""
-          echo "| 项 | 值 |"
-          echo "|---|---|"
-          echo "| 固件版本 | ${BUILD_VERSION_FINAL} |"
-          echo "| 源码提交 | ${SOURCE_COMMIT} |"
-          echo "| 构建时间 | $(date +%FT%T%z) |"
-          echo "| 构建记录 | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |"
-          if [ -n "${RUN_LABEL}" ]; then
-            echo "| 运行显示名 | ${RUN_LABEL} |"
-          fi
-          echo ""
-          echo "## 资产说明"
-          echo ""
-          echo "| 资产 | 用途 |"
-          echo "|---|---|"
-          echo "| *squashfs-sysupgrade.itb | 整机刷写用的主固件, 保留配置升级 |"
-          echo "| *initramfs-recovery.itb | 内存运行固件, 用于救砖与不写 flash 的验证 |"
-          echo "| *bl31-uboot.fip / *preloader.bin / *-ram-comb-bl2.bin | bootloader 三段, 只在需要重刷引导时使用 |"
-          echo "| *.manifest / sha256sums / profiles.json | 包清单、校验和、设备描述 |"
-          echo "| mt7988d-tplink-tl-7dr7230-v2.dtb | 本机设备树, 供反编译核对节点 |"
-          echo "| packages.tar.zst | 本轮全部 ipk 包内容, 供定层排查与单独装包 |"
-          echo "| firmware-bundle.tar.zst | 上面这些单文件的整包归档, 便于一次下载全部 |"
-          echo "| build-dir.tar.zst.part* | 编译现场(内核源码、驱动源码、全套 .o/.ko/.o.cmd、staging 与工具链), 分卷 |"
-          echo "| build-info.txt | 补丁应用统计与产物体积 |"
-          echo "| release-notes.md | 本文件 |"
-          echo ""
-          echo "## 编译现场分卷还原"
-          echo ""
-          echo '```'
-          echo "cat build-dir.tar.zst.part* | zstd -d | tar -xf - -C <目标目录>"
-          echo '```'
-          echo ""
-          echo "还原后目录结构为 <目标目录>/build_dir/... 与 <目标目录>/staging_dir/..."
-          echo ""
-          echo "## 验收数字(本轮自动统计)"
-          echo ""
-          echo '```'
-          cat /workdir/mt-wifi7-migration-check.txt 2>/dev/null || echo "(迁移检查文件缺失)"
-          echo ""
-          cat /workdir/build-info.txt 2>/dev/null || echo "(构建信息文件缺失)"
-          echo '```'
-        } > "$NOTES"
-        wc -l "$NOTES"
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: Upload release notes to source repository
-      if: steps.notes.outputs.status == 'success' && env.UPLOAD_RELEASE_NOTES_TO_SOURCE == 'true' && !cancelled()
-      continue-on-error: true
-      env:
-        GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
-      run: |
-        # 把发版说明回写到私有源码仓库的 tmp/固件及编译日志/<版本号>/release-notes.md,
-        # 使"本轮固件的全部结论"在源码仓一处可查. 用 GitHub contents API 单文件写入, 不 clone 仓库.
-        # 写入目标是本次检出的分支(SOURCE_REF), 不是 main.
-        NOTES="${RELEASE_NOTES}"
-        DEST="tmp/固件及编译日志/${BUILD_VERSION_FINAL}/release-notes.md"
-        if [ ! -f "$NOTES" ]; then
-          echo "发版说明文件不存在, 跳过回写"
-          exit 0
-        fi
-        # 路径含中文, 交给 curl 前先做一次 URL 编码
-        enc_path=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$DEST")
-        content_b64=$(base64 -w0 "$NOTES")
-        # 先查该路径是否已存在, 拿到 blob sha 才能更新而不是新建
-        sha=""
-        resp=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-          "https://api.github.com/repos/${SOURCE_REPO}/contents/${enc_path}?ref=${SOURCE_REF}" || true)
-        if [ -n "$resp" ]; then
-          sha=$(printf '%s' "$resp" | python3 - <<'PYEOF'
-        import json, sys
-        try:
-            data = json.loads(sys.stdin.read())
-            print(data.get("sha", ""))
-        except Exception:
-            print("")
-        PYEOF
-        )
-        fi
-        payload=$(python3 - "$enc_path" "$content_b64" "$sha" "$BUILD_VERSION_FINAL" <<'PYEOF'
-        import json, sys
-        path, b64, sha, msg = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-        body = {"message": f"docs(固件日志): 回写 {msg} 的发版说明", "content": b64}
-        if sha:
-            body["sha"] = sha
-        print(json.dumps(body))
-        PYEOF
-        )
-        code=$(curl -sS -o /tmp/put-resp.json -w '%{http_code}' -X PUT \
-          -H "Authorization: Bearer ${GH_TOKEN}" \
-          -H "Content-Type: application/json" \
-          -d "$payload" \
-          "https://api.github.com/repos/${SOURCE_REPO}/contents/${enc_path}")
-        echo "contents API 返回码 = ${code}"
-        head -c 400 /tmp/put-resp.json 2>/dev/null || true
-        echo
-
     - name: Upload firmware to release
       uses: softprops/action-gh-release@master
-      if: steps.notes.outputs.status == 'success' && !cancelled()
+      if: steps.organize.outputs.status == 'success' && steps.notes.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
