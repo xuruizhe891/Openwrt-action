@@ -547,7 +547,11 @@ jobs:
         # 构建证据(modpost 命中数、symvers 行数、ko 字节数)留在 build-logs artifact 与 build-info.txt, 不进这里.
         echo "release_tag=${BUILD_VERSION_FINAL}" >> $GITHUB_OUTPUT
         python3 - <<'PYEOF'
-        import json, os, subprocess, time
+        import json, os, subprocess
+        from datetime import datetime, timedelta, timezone
+
+        # 全篇时间统一按 UTC+8 显示. 不依赖容器时区设置: runner 镜像或环境若改了时区, 这里不受影响.
+        TZ8 = timezone(timedelta(hours=8))
 
         repo = os.environ["GITHUB_REPOSITORY"]
         source_repo = os.environ["SOURCE_REPO"]
@@ -576,15 +580,27 @@ jobs:
             return sha[:10] if sha else "未知"
 
 
+        def local_time(value):
+            # 接口给的时间形如 2026-11-08T20:01:10Z(UTC), 转成 UTC+8 的 yyyy-mm-dd HH:MM:SS.
+            # 解析不了时原样返回, 不让单个字段异常打断整份说明.
+            if not value:
+                return "未知"
+            try:
+                parsed = datetime.strptime(value.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
+            except ValueError:
+                return value
+            return parsed.astimezone(TZ8).strftime("%Y-%m-%d %H:%M:%S")
+
+
         def commit_rows(commits):
             rows = []
             for idx, c in enumerate(commits, 1):
                 sha = (c.get("sha") or "")[:10]
                 author = (c.get("commit") or {}).get("author") or {}
-                date = (author.get("date") or "")[:10]
+                when = local_time(author.get("date"))
                 msg = ((c.get("commit") or {}).get("message") or "").split("\n")[0]
                 msg = msg.replace("|", "\\|")
-                rows.append("| %d | %s | %s | %s |" % (idx, date, sha, msg))
+                rows.append("| %d | %s | %s | %s |" % (idx, when, sha, msg))
             return rows
 
 
@@ -603,14 +619,17 @@ jobs:
 
 
         def main():
-            now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+            # 全篇只取一次时间, 这一处是唯一的来源. 该值同时写进说明正文与 GITHUB_OUTPUT,
+            # 后者供 Organize files 写 version.txt 的 built_at, 两处因此是同一秒, 不会出现两个时间.
+            now_dt = datetime.now(TZ8)
+            now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             today = now[:10]
             lines = []
             lines.append("# %s 固件发布说明(%s)" % (cur_version, today))
             lines.append("")
-            lines.append("版本 %s, 构建日期 %s" % (cur_version, now))
+            lines.append("版本 %s, 构建时刻 %s (UTC+8, 本轮 CI 生成这份说明时取得)" % (cur_version, now))
             lines.append("")
-            lines.append("| | 版本 | 代码状态 | 打包时间 |")
+            lines.append("| | 版本 | 代码状态 | 构建时刻(UTC+8) |")
             lines.append("|---|---|---|---|")
 
             prev = None
@@ -648,7 +667,7 @@ jobs:
                             if line.startswith("commit:"):
                                 prev_commit = line.split(":", 1)[1].strip()
                             elif line.startswith("built_at:"):
-                                prev_built = line.split(":", 1)[1].strip()
+                                prev_built = local_time(line.split(":", 1)[1].strip())
 
             lines.append("| 本次 | %s | %s | %s |" % (cur_version, short(cur_commit), now))
             if prev_tag:
@@ -658,6 +677,11 @@ jobs:
                 )
             else:
                 lines.append("| 上次 | 未找到上一次打包的 Release | - | - |")
+            lines.append("")
+            lines.append(
+                "构建时刻的来源: 本次一行是本轮 CI 生成这份说明时取得的 UTC+8 时刻, "
+                "同一值写入 version.txt 的 built_at; 上次一行读取的是上次 Release 的 version.txt 里 built_at."
+            )
 
             lines.append("")
             lines.append("## 代码变更(相对上次打包)")
@@ -695,7 +719,7 @@ jobs:
                 lines.append("### 新增 %d 笔" % ahead)
                 lines.append("")
                 if commits:
-                    lines.append("| 序号 | 日期 | 提交 | 标题 |")
+                    lines.append("| 序号 | 时间(UTC+8) | 提交 | 标题 |")
                     lines.append("|---|---|---|---|")
                     lines.extend(commit_rows(commits))
                     if ahead > len(commits):
@@ -719,7 +743,7 @@ jobs:
                     if out:
                         behind_commits = json.loads(out).get("commits") or []
                     if behind_commits:
-                        lines.append("| 序号 | 日期 | 提交 | 标题 |")
+                        lines.append("| 序号 | 时间(UTC+8) | 提交 | 标题 |")
                         lines.append("|---|---|---|---|")
                         lines.extend(commit_rows(behind_commits))
                         if behind > len(behind_commits):
@@ -759,6 +783,14 @@ jobs:
                 fp.write(body)
             print(body)
 
+            # 把同一个时刻交给后续步骤: Organize files 写 version.txt 的 built_at 用这个值,
+            # 于是说明正文与 version.txt 两处是同一秒, 不出现两个互相矛盾的时间.
+            # 写法沿用 version.txt 原有的 ISO 形态(带 +0800 偏移), 不改变既有解析逻辑.
+            out_file = os.environ.get("GITHUB_OUTPUT")
+            if out_file:
+                with open(out_file, "a", encoding="utf-8") as fp:
+                    fp.write("build_time_iso=%s\n" % now_dt.strftime("%Y-%m-%dT%H:%M:%S%z"))
+
 
         main()
         PYEOF
@@ -768,6 +800,10 @@ jobs:
     - name: Organize files
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
+      env:
+        # 与发版说明同一秒的构建时刻, 由 Generate release notes 步骤输出, 写法为 ISO 形态(带 +0800 偏移).
+        # 该步骤未运行(例如关闭 Release 上传)时为空串, built_at 回退为当场取时, 行为与原来一致.
+        BUILD_TIME_ISO: ${{ steps.notes.outputs.build_time_iso }}
       run: |
         cd openwrt/bin/targets/*/*
         # 0. 发版说明按版本号命名后写进固件目录: 于是它同时是 Release 资产、firmware artifact 的成员与归档包成员
@@ -810,7 +846,7 @@ jobs:
         {
           echo "version: ${BUILD_VERSION_FINAL}"
           echo "commit: ${SOURCE_COMMIT}"
-          echo "built_at: $(date +%FT%T%z)"
+          echo "built_at: ${BUILD_TIME_ISO:-$(date +%FT%T%z)}"
           echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
         } > version.txt
 
